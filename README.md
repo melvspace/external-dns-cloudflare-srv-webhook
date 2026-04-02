@@ -21,7 +21,7 @@ external-dns has a built-in Cloudflare provider, but it does not correctly handl
 
 The built-in provider sends only a flat string target, leaving `weight`, `port`, and `target` empty — Cloudflare rejects the request with HTTP 400.
 
-This webhook replaces the built-in provider. It passes A, AAAA, CNAME, and TXT records through to Cloudflare unchanged, and correctly constructs the `data` object for SRV records.
+This webhook replaces the built-in provider. It passes A, AAAA, CNAME, and TXT records through to Cloudflare unchanged, correctly constructs the `data` object for SRV records, and supports enabling Cloudflare proxy mode on A and CNAME records via an annotation.
 
 ## How it works
 
@@ -61,6 +61,16 @@ This webhook parses that string and maps it to the Cloudflare `data` struct:
 
 On reads (`GET /records`), the reverse happens — the Cloudflare `data` object is serialized back into the `"priority weight port target"` string that external-dns expects.
 
+### Cloudflare proxy mode
+
+By default all records are created with `proxied: false`. To enable Cloudflare's proxy (orange cloud) for an A or CNAME record, add the following annotation to your Service or Ingress:
+
+```yaml
+external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"
+```
+
+This has no effect on SRV, AAAA, or TXT records — Cloudflare only supports proxying for A and CNAME.
+
 ### Zone discovery
 
 On startup the webhook calls `GET /zones` and filters the results to zones matching `CF_DOMAIN_FILTER`. Zone IDs are cached in memory for the lifetime of the process. When looking up which zone a record belongs to, it uses longest-suffix matching so subzones resolve correctly.
@@ -99,10 +109,10 @@ The chart automatically configures external-dns with `--provider=webhook --webho
 |---|---|---|
 | SRV records | Broken — sends empty `weight`/`port`/`target` to Cloudflare API | Correctly maps `"priority weight port target"` string to Cloudflare `data` struct |
 | Deployment | Compiled into external-dns binary | Runs as a sidecar, deployed separately |
-| Dependencies | Part of external-dns release cycle | Independent, zero external Go dependencies |
-| Cloudflare proxy | Configurable per record | Always disabled (`proxied: false`) — required for non-HTTP record types |
-| Zone pagination | Handled | First 100 zones only (sufficient for most setups) |
-| Record pagination | Handled | First 100 records per zone only |
+| Dependencies | Part of external-dns release cycle | Independent, uses official [`cloudflare-go`](https://github.com/cloudflare/cloudflare-go) SDK |
+| Cloudflare proxy | Configurable per record | Disabled by default; enable per record with `external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"` annotation (A and CNAME only) |
+| Zone pagination | Handled | Handled — SDK auto-paginates all zone and record list calls |
+| Record pagination | Handled | Handled — SDK auto-paginates all zone and record list calls |
 
 ## Building
 

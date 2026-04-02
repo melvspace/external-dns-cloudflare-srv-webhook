@@ -4,7 +4,7 @@
 
 - [ ] **Fix update atomicity** — replace delete-then-create with Cloudflare's PUT endpoint to avoid record loss on failed creation
 - [ ] **Propagate errors to external-dns** — return non-2xx on `POST /records` when any change fails; currently always returns 204
-- [ ] **Fix SRV parsing error propagation** — `parseSRVTarget()` logs and drops errors silently; return the error so the caller can skip or reject the record
+- [x] ~~**Fix SRV parsing error propagation** — `parseSRVTarget()` logs and drops errors silently; return the error so the caller can skip or reject the record~~
 
 ## Bugs
 
@@ -14,7 +14,7 @@
 ## Reliability
 
 - [ ] **Add HTTP client timeout** — `http.DefaultClient` has no timeout; set one on the Cloudflare API client to avoid indefinite hangs
-- [ ] **Pagination** — only fetches first 100 zones and 100 records per zone; implement cursor-based pagination or at least log a warning when the limit is reached
+- [x] ~~**Pagination** — only fetches first 100 zones and 100 records per zone; implement cursor-based pagination or at least log a warning when the limit is reached~~
 - [ ] **Graceful shutdown** — handle `SIGTERM` to drain in-flight requests before exiting
 
 ## Testing

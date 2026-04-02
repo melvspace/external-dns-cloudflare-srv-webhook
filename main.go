@@ -1,30 +1,43 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+
+	cloudflare "github.com/cloudflare/cloudflare-go"
 )
 
-const (
-	webhookContentType = "application/external.dns.webhook+json;version=1"
-	cfBaseURL          = "https://api.cloudflare.com/client/v4"
-)
+const webhookContentType = "application/external.dns.webhook+json;version=1"
 
 // ---------- external-dns types ----------
 
+type ProviderSpecificProperty struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type Endpoint struct {
-	DNSName    string            `json:"dnsName"`
-	Targets    []string          `json:"targets"`
-	RecordType string            `json:"recordType"`
-	RecordTTL  int64             `json:"recordTTL,omitempty"`
-	Labels     map[string]string `json:"labels,omitempty"`
+	DNSName          string                     `json:"dnsName"`
+	Targets          []string                   `json:"targets"`
+	RecordType       string                     `json:"recordType"`
+	RecordTTL        int64                      `json:"recordTTL,omitempty"`
+	Labels           map[string]string          `json:"labels,omitempty"`
+	ProviderSpecific []ProviderSpecificProperty `json:"providerSpecific,omitempty"`
+}
+
+func (ep *Endpoint) getProviderSpecific(name string) (string, bool) {
+	for _, p := range ep.ProviderSpecific {
+		if p.Name == name {
+			return p.Value, true
+		}
+	}
+	return "", false
 }
 
 type Changes struct {
@@ -34,55 +47,10 @@ type Changes struct {
 	Delete    []*Endpoint `json:"Delete"`
 }
 
-// ---------- Cloudflare API types ----------
-
-type cfZone struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-type cfZoneListResponse struct {
-	Result []cfZone `json:"result"`
-	Success bool     `json:"success"`
-}
-
-type cfDNSRecord struct {
-	ID      string          `json:"id,omitempty"`
-	Type    string          `json:"type"`
-	Name    string          `json:"name"`
-	Content string          `json:"content,omitempty"`
-	TTL     int64           `json:"ttl,omitempty"`
-	Proxied bool            `json:"proxied,omitempty"`
-	Data    *cfSRVData      `json:"data,omitempty"`
-}
-
-type cfSRVData struct {
-	Priority int    `json:"priority"`
-	Weight   int    `json:"weight"`
-	Port     int    `json:"port"`
-	Target   string `json:"target"`
-}
-
-type cfDNSListResponse struct {
-	Result  []cfDNSRecord `json:"result"`
-	Success bool          `json:"success"`
-}
-
-type cfError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-type cfDNSCreateResponse struct {
-	Result  cfDNSRecord `json:"result"`
-	Success bool        `json:"success"`
-	Errors  []cfError   `json:"errors"`
-}
-
 // ---------- proxy state ----------
 
 type proxy struct {
-	apiToken     string
+	cf           *cloudflare.API
 	domainFilter []string
 	// zone name -> zone ID
 	zones map[string]string
@@ -103,8 +71,13 @@ func newProxy() (*proxy, error) {
 		}
 	}
 
+	api, err := cloudflare.NewWithAPIToken(token)
+	if err != nil {
+		return nil, fmt.Errorf("creating Cloudflare client: %w", err)
+	}
+
 	p := &proxy{
-		apiToken:     token,
+		cf:           api,
 		domainFilter: filters,
 		zones:        make(map[string]string),
 	}
@@ -116,50 +89,15 @@ func newProxy() (*proxy, error) {
 	return p, nil
 }
 
-// ---------- Cloudflare helpers ----------
-
-func (p *proxy) cfRequest(method, path string, body interface{}) (*http.Response, error) {
-	var bodyReader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		bodyReader = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequest(method, cfBaseURL+path, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+p.apiToken)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
+// ---------- zone helpers ----------
 
 func (p *proxy) loadZones() error {
-	resp, err := p.cfRequest("GET", "/zones?per_page=100", nil)
+	zones, err := p.cf.ListZones(context.Background())
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	var result cfZoneListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
-	if !result.Success {
-		return fmt.Errorf("Cloudflare zones API returned success=false")
-	}
-
-	for _, zone := range result.Result {
+	for _, zone := range zones {
 		if len(p.domainFilter) == 0 {
 			p.zones[zone.Name] = zone.ID
 			continue
@@ -184,8 +122,7 @@ func (p *proxy) zoneNames() []string {
 	return names
 }
 
-// zoneIDForName returns the zone ID that best matches the given DNS name.
-func (p *proxy) zoneIDForName(dnsName string) (string, string, error) {
+func (p *proxy) zoneIDForName(dnsName string) (string, error) {
 	best := ""
 	bestID := ""
 	for zoneName, zoneID := range p.zones {
@@ -197,9 +134,9 @@ func (p *proxy) zoneIDForName(dnsName string) (string, string, error) {
 		}
 	}
 	if bestID == "" {
-		return "", "", fmt.Errorf("no zone found for %q", dnsName)
+		return "", fmt.Errorf("no zone found for %q", dnsName)
 	}
-	return bestID, best, nil
+	return bestID, nil
 }
 
 // ---------- record listing ----------
@@ -207,24 +144,14 @@ func (p *proxy) zoneIDForName(dnsName string) (string, string, error) {
 func (p *proxy) listAllRecords() ([]*Endpoint, error) {
 	var endpoints []*Endpoint
 
-	for zoneName, zoneID := range p.zones {
-		_ = zoneName
-		path := fmt.Sprintf("/zones/%s/dns_records?per_page=100", zoneID)
-		resp, err := p.cfRequest("GET", path, nil)
+	for _, zoneID := range p.zones {
+		rc := cloudflare.ZoneIdentifier(zoneID)
+		records, _, err := p.cf.ListDNSRecords(context.Background(), rc, cloudflare.ListDNSRecordsParams{})
 		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		var result cfDNSListResponse
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return nil, err
-		}
-		if !result.Success {
-			return nil, fmt.Errorf("Cloudflare dns_records API returned success=false for zone %s", zoneID)
+			return nil, fmt.Errorf("listing records for zone %s: %w", zoneID, err)
 		}
 
-		for _, rec := range result.Result {
+		for _, rec := range records {
 			ep := cfRecordToEndpoint(rec)
 			if ep != nil {
 				endpoints = append(endpoints, ep)
@@ -235,48 +162,73 @@ func (p *proxy) listAllRecords() ([]*Endpoint, error) {
 	return endpoints, nil
 }
 
-func cfRecordToEndpoint(rec cfDNSRecord) *Endpoint {
+func cfRecordToEndpoint(rec cloudflare.DNSRecord) *Endpoint {
 	switch rec.Type {
 	case "A", "AAAA", "CNAME", "TXT":
-		return &Endpoint{
+		ep := &Endpoint{
 			DNSName:    rec.Name,
 			Targets:    []string{rec.Content},
 			RecordType: rec.Type,
-			RecordTTL:  rec.TTL,
+			RecordTTL:  int64(rec.TTL),
 		}
+		if rec.Proxied != nil && *rec.Proxied {
+			ep.ProviderSpecific = []ProviderSpecificProperty{
+				{Name: "external-dns.alpha.kubernetes.io/cloudflare-proxied", Value: "true"},
+			}
+		}
+		return ep
 	case "SRV":
 		if rec.Data == nil {
 			return nil
 		}
-		target := strings.TrimSuffix(rec.Data.Target, ".")
-		targetStr := fmt.Sprintf("%d %d %d %s",
-			rec.Data.Priority, rec.Data.Weight, rec.Data.Port, target)
+		data, ok := rec.Data.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		priority := int(toFloat64(data["priority"]))
+		weight := int(toFloat64(data["weight"]))
+		port := int(toFloat64(data["port"]))
+		target := strings.TrimSuffix(fmt.Sprintf("%v", data["target"]), ".")
+		targetStr := fmt.Sprintf("%d %d %d %s", priority, weight, port, target)
 		return &Endpoint{
 			DNSName:    rec.Name,
 			Targets:    []string{targetStr},
 			RecordType: "SRV",
-			RecordTTL:  rec.TTL,
+			RecordTTL:  int64(rec.TTL),
 		}
 	default:
 		return nil
 	}
 }
 
+func toFloat64(v interface{}) float64 {
+	if v == nil {
+		return 0
+	}
+	f, _ := v.(float64)
+	return f
+}
+
 // ---------- record creation ----------
 
 func (p *proxy) createRecord(ep *Endpoint) error {
-	zoneID, _, err := p.zoneIDForName(ep.DNSName)
+	zoneID, err := p.zoneIDForName(ep.DNSName)
 	if err != nil {
 		return err
 	}
 
+	rc := cloudflare.ZoneIdentifier(zoneID)
+
+	ttl := int(ep.RecordTTL)
+	if ttl == 0 {
+		ttl = 1 // automatic
+	}
+
 	for _, target := range ep.Targets {
-		var rec cfDNSRecord
-		rec.Type = ep.RecordType
-		rec.Name = ep.DNSName
-		rec.TTL = ep.RecordTTL
-		if rec.TTL == 0 {
-			rec.TTL = 1 // automatic
+		params := cloudflare.CreateDNSRecordParams{
+			Type: ep.RecordType,
+			Name: ep.DNSName,
+			TTL:  ttl,
 		}
 
 		if ep.RecordType == "SRV" {
@@ -284,24 +236,21 @@ func (p *proxy) createRecord(ep *Endpoint) error {
 			if err != nil {
 				return fmt.Errorf("parsing SRV target %q: %w", target, err)
 			}
-			rec.Data = data
+			params.Data = data
 		} else {
-			rec.Content = target
+			params.Content = target
+
+			if ep.RecordType == "A" || ep.RecordType == "CNAME" {
+				if v, ok := ep.getProviderSpecific("external-dns.alpha.kubernetes.io/cloudflare-proxied"); ok && v == "true" {
+					params.Proxied = cloudflare.BoolPtr(true)
+				} else {
+					params.Proxied = cloudflare.BoolPtr(false)
+				}
+			}
 		}
 
-		path := fmt.Sprintf("/zones/%s/dns_records", zoneID)
-		resp, err := p.cfRequest("POST", path, rec)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-
-		var result cfDNSCreateResponse
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return err
-		}
-		if !result.Success {
-			return fmt.Errorf("Cloudflare create failed for %s %s: %v", ep.RecordType, ep.DNSName, result.Errors)
+		if _, err := p.cf.CreateDNSRecord(context.Background(), rc, params); err != nil {
+			return fmt.Errorf("Cloudflare create failed for %s %s: %w", ep.RecordType, ep.DNSName, err)
 		}
 
 		log.Printf("created %s %s → %s", ep.RecordType, ep.DNSName, target)
@@ -309,8 +258,8 @@ func (p *proxy) createRecord(ep *Endpoint) error {
 	return nil
 }
 
-// parseSRVTarget parses "priority weight port target" into cfSRVData.
-func parseSRVTarget(s string) (*cfSRVData, error) {
+// parseSRVTarget parses "priority weight port target" into a map for the Cloudflare SDK.
+func parseSRVTarget(s string) (map[string]interface{}, error) {
 	parts := strings.Fields(s)
 	if len(parts) != 4 {
 		return nil, fmt.Errorf("expected 4 fields, got %d in %q", len(parts), s)
@@ -331,45 +280,35 @@ func parseSRVTarget(s string) (*cfSRVData, error) {
 	if !strings.HasSuffix(target, ".") {
 		target += "."
 	}
-	return &cfSRVData{
-		Priority: priority,
-		Weight:   weight,
-		Port:     port,
-		Target:   target,
+	return map[string]interface{}{
+		"priority": priority,
+		"weight":   weight,
+		"port":     port,
+		"target":   target,
 	}, nil
 }
 
 // ---------- record deletion ----------
 
 func (p *proxy) deleteRecord(ep *Endpoint) error {
-	zoneID, _, err := p.zoneIDForName(ep.DNSName)
+	zoneID, err := p.zoneIDForName(ep.DNSName)
 	if err != nil {
 		return err
 	}
 
-	path := fmt.Sprintf("/zones/%s/dns_records?name=%s&type=%s",
-		zoneID, ep.DNSName, ep.RecordType)
-	resp, err := p.cfRequest("GET", path, nil)
+	rc := cloudflare.ZoneIdentifier(zoneID)
+	records, _, err := p.cf.ListDNSRecords(context.Background(), rc, cloudflare.ListDNSRecordsParams{
+		Name: ep.DNSName,
+		Type: ep.RecordType,
+	})
 	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	var result cfDNSListResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
-	if !result.Success {
-		return fmt.Errorf("listing records for deletion failed: %s %s", ep.RecordType, ep.DNSName)
+		return fmt.Errorf("listing records for deletion %s %s: %w", ep.RecordType, ep.DNSName, err)
 	}
 
-	for _, rec := range result.Result {
-		delPath := fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, rec.ID)
-		delResp, err := p.cfRequest("DELETE", delPath, nil)
-		if err != nil {
-			return err
+	for _, rec := range records {
+		if err := p.cf.DeleteDNSRecord(context.Background(), rc, rec.ID); err != nil {
+			return fmt.Errorf("deleting record %s: %w", rec.ID, err)
 		}
-		delResp.Body.Close()
 		log.Printf("deleted %s %s (id=%s)", ep.RecordType, ep.DNSName, rec.ID)
 	}
 
