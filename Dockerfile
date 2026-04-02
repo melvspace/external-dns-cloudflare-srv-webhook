@@ -3,12 +3,12 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY main.go ./
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-s -w" -o webhook .
 
 # Stage 2: minimal runtime
