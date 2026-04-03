@@ -40,6 +40,16 @@ func (ep *Endpoint) getProviderSpecific(name string) (string, bool) {
 	return "", false
 }
 
+func (ep *Endpoint) setProviderSpecific(name, value string) {
+	for i, p := range ep.ProviderSpecific {
+		if p.Name == name {
+			ep.ProviderSpecific[i].Value = value
+			return
+		}
+	}
+	ep.ProviderSpecific = append(ep.ProviderSpecific, ProviderSpecificProperty{Name: name, Value: value})
+}
+
 type Changes struct {
 	Create    []*Endpoint `json:"Create"`
 	UpdateOld []*Endpoint `json:"UpdateOld"`
@@ -183,7 +193,6 @@ func cfRecordToEndpoint(rec cloudflare.DNSRecord) *Endpoint {
 			DNSName:    rec.Name,
 			Targets:    []string{rec.Content},
 			RecordType: rec.Type,
-			RecordTTL:  int64(rec.TTL),
 		}
 		if rec.Proxied != nil && *rec.Proxied {
 			ep.ProviderSpecific = []ProviderSpecificProperty{
@@ -208,7 +217,6 @@ func cfRecordToEndpoint(rec cloudflare.DNSRecord) *Endpoint {
 			DNSName:    rec.Name,
 			Targets:    []string{targetStr},
 			RecordType: "SRV",
-			RecordTTL:  int64(rec.TTL),
 		}
 	default:
 		return nil
@@ -412,7 +420,19 @@ func (p *proxy) handleAdjustEndpoints(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// Pass through unchanged
+	// Inject the cloudflare-proxied property so external-dns's desired state
+	// matches what we return from GET /records, preventing perpetual thrashing.
+	for _, ep := range endpoints {
+		if ep.RecordType != "A" && ep.RecordType != "AAAA" && ep.RecordType != "CNAME" {
+			continue
+		}
+		proxied := p.proxiedDefault
+		if v, ok := ep.getProviderSpecific("external-dns.alpha.kubernetes.io/cloudflare-proxied"); ok {
+			proxied = strings.EqualFold(v, "true")
+		}
+		// Ensure the property is present and consistent
+		ep.setProviderSpecific("external-dns.alpha.kubernetes.io/cloudflare-proxied", strconv.FormatBool(proxied))
+	}
 	writeJSON(w, http.StatusOK, endpoints)
 }
 
