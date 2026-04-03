@@ -50,8 +50,9 @@ type Changes struct {
 // ---------- proxy state ----------
 
 type proxy struct {
-	cf           *cloudflare.API
-	domainFilter []string
+	cf             *cloudflare.API
+	domainFilter   []string
+	proxiedDefault bool
 	// zone name -> zone ID
 	zones map[string]string
 }
@@ -76,11 +77,16 @@ func newProxy() (*proxy, error) {
 		return nil, fmt.Errorf("creating Cloudflare client: %w", err)
 	}
 
+	proxiedDefault := strings.EqualFold(os.Getenv("CF_PROXIED"), "true")
+
 	p := &proxy{
-		cf:           api,
-		domainFilter: filters,
-		zones:        make(map[string]string),
+		cf:             api,
+		domainFilter:   filters,
+		proxiedDefault: proxiedDefault,
+		zones:          make(map[string]string),
 	}
+
+	log.Printf("proxied default: %v", proxiedDefault)
 
 	if err := p.loadZones(); err != nil {
 		return nil, fmt.Errorf("loading zones: %w", err)
@@ -240,12 +246,12 @@ func (p *proxy) createRecord(ep *Endpoint) error {
 		} else {
 			params.Content = target
 
-			if ep.RecordType == "A" || ep.RecordType == "CNAME" {
-				if v, ok := ep.getProviderSpecific("external-dns.alpha.kubernetes.io/cloudflare-proxied"); ok && v == "true" {
-					params.Proxied = cloudflare.BoolPtr(true)
-				} else {
-					params.Proxied = cloudflare.BoolPtr(false)
+			if ep.RecordType == "A" || ep.RecordType == "AAAA" || ep.RecordType == "CNAME" {
+				proxied := p.proxiedDefault
+				if v, ok := ep.getProviderSpecific("external-dns.alpha.kubernetes.io/cloudflare-proxied"); ok {
+					proxied = strings.EqualFold(v, "true")
 				}
+				params.Proxied = cloudflare.BoolPtr(proxied)
 			}
 		}
 
