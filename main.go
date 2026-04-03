@@ -128,7 +128,18 @@ func (p *proxy) zoneNames() []string {
 	return names
 }
 
+// errNotOurZone is returned when a DNS name does not belong to any zone
+// managed by this webhook instance. Callers should skip silently.
+var errNotOurZone = fmt.Errorf("not our zone")
+
 func (p *proxy) zoneIDForName(dnsName string) (string, error) {
+	if id := p.bestZone(dnsName); id != "" {
+		return id, nil
+	}
+	return "", errNotOurZone
+}
+
+func (p *proxy) bestZone(dnsName string) string {
 	best := ""
 	bestID := ""
 	for zoneName, zoneID := range p.zones {
@@ -139,10 +150,7 @@ func (p *proxy) zoneIDForName(dnsName string) (string, error) {
 			}
 		}
 	}
-	if bestID == "" {
-		return "", fmt.Errorf("no zone found for %q", dnsName)
-	}
-	return bestID, nil
+	return bestID
 }
 
 // ---------- record listing ----------
@@ -373,24 +381,24 @@ func (p *proxy) handleApplyChanges(w http.ResponseWriter, r *http.Request) {
 
 	// Delete old records first (UpdateOld + Delete)
 	for _, ep := range changes.Delete {
-		if err := p.deleteRecord(ep); err != nil {
+		if err := p.deleteRecord(ep); err != nil && err != errNotOurZone {
 			log.Printf("ERROR deleting %s %s: %v", ep.RecordType, ep.DNSName, err)
 		}
 	}
 	for _, ep := range changes.UpdateOld {
-		if err := p.deleteRecord(ep); err != nil {
+		if err := p.deleteRecord(ep); err != nil && err != errNotOurZone {
 			log.Printf("ERROR deleting (update-old) %s %s: %v", ep.RecordType, ep.DNSName, err)
 		}
 	}
 
 	// Create new records (Create + UpdateNew)
 	for _, ep := range changes.Create {
-		if err := p.createRecord(ep); err != nil {
+		if err := p.createRecord(ep); err != nil && err != errNotOurZone {
 			log.Printf("ERROR creating %s %s: %v", ep.RecordType, ep.DNSName, err)
 		}
 	}
 	for _, ep := range changes.UpdateNew {
-		if err := p.createRecord(ep); err != nil {
+		if err := p.createRecord(ep); err != nil && err != errNotOurZone {
 			log.Printf("ERROR creating (update-new) %s %s: %v", ep.RecordType, ep.DNSName, err)
 		}
 	}
