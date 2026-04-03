@@ -63,13 +63,18 @@ On reads (`GET /records`), the reverse happens — the Cloudflare `data` object 
 
 ### Cloudflare proxy mode
 
-By default all records are created with `proxied: false`. To enable Cloudflare's proxy (orange cloud) for an A or CNAME record, add the following annotation to your Service or Ingress:
+By default all records are created with `proxied: false`. There are two ways to enable Cloudflare's proxy (orange cloud):
+
+**Global default** — set `CF_PROXIED=true` to proxy all A, AAAA, and CNAME records unless overridden per record.
+
+**Per-record override** — add the following annotation to your Service or Ingress:
 
 ```yaml
-external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"
+external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"   # enable
+external-dns.alpha.kubernetes.io/cloudflare-proxied: "false"  # disable (overrides CF_PROXIED)
 ```
 
-This has no effect on SRV, AAAA, or TXT records — Cloudflare only supports proxying for A and CNAME.
+The annotation always takes precedence over `CF_PROXIED`. This has no effect on SRV or TXT records — Cloudflare only supports proxying for A, AAAA, and CNAME.
 
 ### Zone discovery
 
@@ -102,6 +107,7 @@ The chart automatically configures external-dns with `--provider=webhook --webho
 |---------|----------|-------------|
 | `CF_API_TOKEN` | Yes | Cloudflare API token with DNS edit permissions |
 | `CF_DOMAIN_FILTER` | No | Comma-separated list of zones to manage (e.g. `example.com,other.com`). If empty, all zones in the account are managed. |
+| `CF_PROXIED` | No | Set to `true` to enable Cloudflare proxy (orange cloud) for all A, AAAA, and CNAME records by default. Can be overridden per record with the `cloudflare-proxied` annotation. Default: `false`. |
 
 ## Differences from the built-in Cloudflare provider
 
@@ -110,7 +116,7 @@ The chart automatically configures external-dns with `--provider=webhook --webho
 | SRV records | Broken — sends empty `weight`/`port`/`target` to Cloudflare API | Correctly maps `"priority weight port target"` string to Cloudflare `data` struct |
 | Deployment | Compiled into external-dns binary | Runs as a sidecar, deployed separately |
 | Dependencies | Part of external-dns release cycle | Independent, uses official [`cloudflare-go`](https://github.com/cloudflare/cloudflare-go) SDK |
-| Cloudflare proxy | Configurable per record | Disabled by default; enable per record with `external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"` annotation (A and CNAME only) |
+| Cloudflare proxy | Configurable per record | Global default via `CF_PROXIED`; per-record override via `cloudflare-proxied` annotation (A, AAAA, and CNAME only) |
 | Zone pagination | Handled | Handled — SDK auto-paginates all zone and record list calls |
 | Record pagination | Handled | Handled — SDK auto-paginates all zone and record list calls |
 
